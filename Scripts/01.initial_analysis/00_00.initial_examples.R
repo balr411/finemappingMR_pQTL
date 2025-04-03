@@ -4,8 +4,13 @@
 
 library("data.table")
 library("stringr")
-library("RcppCNPy")
+#library("RcppCNPy")
 library("finemappingMR")
+library("reticulate")
+library("dplyr")
+
+use_condaenv("r-reticulate", required = TRUE) #Not sure if this will work great on the cluster?
+
 
 df_res <- fread("/net/1000g/hmkang/etc/ukb/ppp/finemapping/sentinel/EURv2_merged_sentinel.cis_trans.wgs.tsv.gz",
                 header = TRUE,
@@ -90,6 +95,11 @@ which(genes_full == "PLA2G7") #2076
 df_pcsk9 <- df_full_sum_stat[,c(1:5, (2004*6):(2004*6 + 5))]
 df_pla2g7 <- df_full_sum_stat[,c(1:5, (2076*6):(2076*6 + 5))]
 
+#Remove duplicated positions
+df_pcsk9 <- anti_join(df_pcsk9, df_pcsk9[duplicated(df_pcsk9[,2]),], by = "POS")
+df_pla2g7 <- anti_join(df_pla2g7, df_pla2g7[duplicated(df_pla2g7[,2]),], by = "POS")
+
+
 #Get rid of the rows with no beta:
 df_pcsk9 <- df_pcsk9[complete.cases(df_pcsk9),]
 df_pla2g7 <- df_pla2g7[complete.cases(df_pla2g7),]
@@ -103,8 +113,8 @@ snps_common <- intersect(df_pcsk9$ID, df_pla2g7$ID)
 df_pcsk9 <- df_pcsk9[df_pcsk9$ID %in% snps_common,]
 df_pla2g7 <- df_pla2g7[df_pla2g7$ID %in% snps_common,]
 
-nrow(df_pcsk9) #4124
-nrow(df_pla2g7) #4124
+nrow(df_pcsk9) #4113 (was 4124 before removing multi-allelics)
+nrow(df_pla2g7) #4113
 
 all.equal(df_pcsk9$ID, df_pla2g7$ID) #TRUE
 
@@ -120,8 +130,11 @@ z_pla2g7   <- sqrt(pla2g7_adj) * df_pla2g7[,10]
 df_pla2g7$z_adj <- z_pla2g7
 
 #Results given on standardized scale if var(y) unknown(?) - again taken from SuSiE code
-pcsk9_xty <- sqrt(pcsk9_n - 1)*df_pcsk9$z_adj
-pla2g7_xty <- sqrt(pla2g7_n - 1)*df_pla2g7$z_adj
+pcsk9_xty <- list()
+pcsk9_xty[[1]] <- sqrt(pcsk9_n - 1)*df_pcsk9$z_adj
+
+pla2g7_xty <- list()
+pla2g7_xty[[1]] <- sqrt(pla2g7_n - 1)*df_pla2g7$z_adj
 
 ##################################################################################
 #Now read in the LD
@@ -132,10 +145,72 @@ upper_b37 <- max(pos_b37)
 
 #Region is 55005704:56005610
 #Hence should be able to use the file /net/1000g/hmkang/data/UKBB_LD/chr1_55000001_58000001.npz
-library(reticulate)
-np <- import("numpy")
 
-ld_mat <- npyLoad("/net/1000g/hmkang/data/UKBB_LD/chr1_55000001_58000001.npz")
+#To read in the LD, I am first going to read in the file /net/1000g/hmkang/data/UKBB_LD/chr1_55000001_58000001.gz,
+#and match the indices that I'll need LD for to the indices in that file. Then
+#I will output these indices, and use them to write out a new (much smaller) .npz
+#file which can be converted to dense format in R
 
+ld_pos <- fread("/net/1000g/hmkang/data/UKBB_LD/chr1_55000001_58000001.gz",
+                header = TRUE,
+                data.table = FALSE)
+
+#Some positions may not appear in the LD matrix, so check that first:
+pcsk9_id_rd <- gsub(":imp:v1", "", df_pcsk9$ID, fixed = TRUE)
+ld_pos_id <- paste(ld_pos$chromosome, ld_pos$position, ld_pos$allele1, ld_pos$allele2, sep = ":")
+sum(ld_pos_id %in% pcsk9_id_rd) #4113 hence they are all present
+
+#Now get indices:
+idx_to_output <- which(ld_pos_id %in% pcsk9_id_rd) ## Duplicate positions (multi-allelic variants) will mess this up - go back and delete them
+all.equal(ld_pos_id[idx_to_output], pcsk9_id_rd) #TRUE
+
+#np <- import("numpy") -> This causes issues when calling sparse_ld_subset(), because the ndarray is not automatically converted to a matrix
+#In the future if I want to use something like this, I need to add convert = FALSE to the import() command
+#ld_mat <- np$load("/net/1000g/hmkang/data/UKBB_LD/chr1_55000001_58000001.npz")
+source_python("../../Scripts/01.initial_analysis/00_01.python_scripts.py")
+
+#Python indices start at 0 so subtract one from each index: 
+idx_to_output <- idx_to_output - 1
+ld_mat_red <- sparse_ld_subset("/net/1000g/hmkang/data/UKBB_LD/chr1_55000001_58000001.npz", idx_to_output)
+
+## This works
+
+pcsk9_xtx <- list()
+pcsk9_xtx[[1]] <- (pcsk9_n - 1)*ld_mat_red
+
+pla2g7_xtx <- list()
+pla2g7_xtx[[1]] <- (pla2g7_n - 1)*ld_mat_red
+
+pcsk9_var <- 1
+pla2g7_var <- 1
+
+#Now call finemappingMR 
+res_our_method <- run_freq_method_ss(pcsk9_xtx, pcsk9_xty, pcsk9_n - 1,
+                                     pla2g7_xtx, pla2g7_xty, pla2g7_n - 1,
+                                     pcsk9_n, pla2g7_n,
+                                     L_x = 10, L_y = 10,
+                                     scaled_prior_variance_x = 0.2,
+                                     scaled_prior_variance_y = 0.2,
+                                     estimate_prior_variance_x = TRUE,
+                                     estimate_prior_variance_y = TRUE,
+                                     residual_variance_x = NULL,
+                                     residual_variance_y = NULL,
+                                     estimate_residual_variance_x = FALSE,
+                                     estimate_residual_variance_y = FALSE,
+                                     tol = 1e-4,
+                                     max_iter = 1000,
+                                     calc_cs_x = TRUE,
+                                     calc_cs_y = TRUE,
+                                     verbose = TRUE)
+
+
+
+res_our_method$res
+#gamma    gamma_var iter
+#0.1991038 0.0004407491   14
+
+2*pnorm(-0.1991038/sqrt(0.0004407491)) #2.451137e-21
+
+#Highly significant and in the correct direction
 
 
